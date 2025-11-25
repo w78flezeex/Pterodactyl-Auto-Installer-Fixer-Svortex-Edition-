@@ -23,7 +23,7 @@
 
 Запустите следующую команду на вашем чистом сервере (Ubuntu 20.04/22.04, Debian 10/11):
 
-bash <(curl -s https://raw.githubusercontent.com/ВАШ_НИК/ВАШ_РЕПОЗИТОРИЙ/main/install-custom.sh)*(Замените ссылку на актуальную ссылку к вашему скрипту после загрузки на GitHub)*
+bash <(curl -s https://github.com/w78flezeex/Pterodactyl-Auto-Installer-Fixer-Svortex-Edition-?tab=readme-ov-file#pterodactyl-auto-installer--fixer-svortex-edition)*
 
 ### Процесс установки:
 1.  Запустите скрипт.
