@@ -4,9 +4,10 @@ set -e
 
 ######################################################################################
 #                                                                                    #
-# Project 'pterodactyl-installer' (MODIFIED VERSION)                                 #
+# Project 'pterodactyl-installer' (Svortex Edition - FIXED)                          #
 #                                                                                    #
-# Этот скрипт автоматически применяет фиксы портов и NAT Loopback                    #
+# Этот скрипт автоматически применяет фиксы портов, NAT и CORS.                      #
+# Добавлена возможность исправления уже установленной системы.                       #
 #                                                                                    #
 ######################################################################################
 
@@ -18,7 +19,7 @@ LOG_PATH="/var/log/pterodactyl-installer.log"
 
 # --- БЛОК ЗАПРОСА ПОРТОВ ---
 echo -e "\n################################################################################"
-echo -e "# НАСТРОЙКА ПОРТОВ (MODIFIED INSTALLER)                                        #"
+echo -e "# НАСТРОЙКА ПОРТОВ (SVORTEX FIXER)                                             #"
 echo -e "################################################################################\n"
 
 read -p "Введите порт для ПАНЕЛИ (по умолчанию 80, мы ставили 2963): " INPUT_PANEL_PORT
@@ -31,14 +32,13 @@ read -p "Введите порт для WINGS SFTP (по умолчанию 2022
 SFTP_PORT=${INPUT_SFTP_PORT:-2022}
 
 echo -e "\nБудут использованы порты: Панель: $PANEL_PORT | Wings: $WINGS_PORT | SFTP: $SFTP_PORT"
-echo -e "Установка продолжится через 3 секунды...\n"
+echo -e "Установка/Исправление начнется через 3 секунды...\n"
 sleep 3
 # ---------------------------
 
 # check for curl
 if ! [ -x "$(command -v curl)" ]; then
   echo "* curl is required in order for this script to work."
-  echo "* install using apt (Debian and derivatives) or yum/dnf (CentOS)"
   exit 1
 fi
 
@@ -56,25 +56,30 @@ apply_custom_fixes() {
 
   echo -e "\n[AUTO-FIX] Применяю исправления для $COMPONENT..."
 
-  # 1. Фиксы для ПАНЕЛИ
+  # === 1. Фиксы для ПАНЕЛИ ===
   if [[ "$COMPONENT" == "panel" ]]; then
     if [ -f /etc/nginx/sites-available/pterodactyl.conf ]; then
         echo "[AUTO-FIX] Настройка Nginx порта на $PANEL_PORT..."
-        # Меняем порт 80 на кастомный
+        
+        # Меняем порты в Nginx
+        sed -i "s/listen .*; # ssl/listen $PANEL_PORT; # ssl/g" /etc/nginx/sites-available/pterodactyl.conf || true
         sed -i "s/listen 80;/listen $PANEL_PORT;/g" /etc/nginx/sites-available/pterodactyl.conf
         sed -i "s/listen \[::\]:80;/listen \[::\]:$PANEL_PORT;/g" /etc/nginx/sites-available/pterodactyl.conf
         
-        # Исправляем ошибку проксирования (убираем remote из location)
-        echo "[AUTO-FIX] Исправление проксирования Nginx..."
+        # Исправляем ошибку проксирования
         sed -i 's/system|servers|remote/system|servers/g' /etc/nginx/sites-available/pterodactyl.conf
         
-        # Обновляем APP_URL в .env если там нет порта
+        # Обновляем APP_URL в .env (КРИТИЧНО ВАЖНО С ПОРТОМ)
         if [ -f /var/www/pterodactyl/.env ]; then
-             # Если порт не 80 и он еще не прописан в APP_URL
-             if [[ "$PANEL_PORT" != "80" ]]; then
-                 sed -i "s|APP_URL=http://.*|APP_URL=http://$EXT_IP:$PANEL_PORT|g" /var/www/pterodactyl/.env
-                 cd /var/www/pterodactyl && php artisan config:clear && php artisan cache:clear
-             fi
+             echo "[AUTO-FIX] Обновление APP_URL в .env..."
+             # Сначала убираем порт если он был, потом ставим новый, чтобы не дублировать
+             sed -i "s|APP_URL=http://.*|APP_URL=http://$EXT_IP:$PANEL_PORT|g" /var/www/pterodactyl/.env
+             
+             cd /var/www/pterodactyl
+             php artisan config:clear || true
+             php artisan cache:clear || true
+             php artisan route:clear || true
+             php artisan queue:restart || true
         fi
 
         systemctl reload nginx
@@ -85,9 +90,11 @@ apply_custom_fixes() {
     iptables -A INPUT -p tcp --dport $PANEL_PORT -j ACCEPT
   fi
 
-  # 2. Фиксы для WINGS
+  # === 2. Фиксы для WINGS ===
   if [[ "$COMPONENT" == "wings" ]]; then
-    echo "[AUTO-FIX] Настройка портов Wings..."
+    echo "[AUTO-FIX] Настройка конфигурации Wings..."
+    
+    CONFIG_FILE="/etc/pterodactyl/config.yml"
     
     # Открываем порты
     ufw allow $WINGS_PORT/tcp > /dev/null 2>&1
@@ -95,22 +102,31 @@ apply_custom_fixes() {
     iptables -A INPUT -p tcp --dport $WINGS_PORT -j ACCEPT
     iptables -A INPUT -p tcp --dport $SFTP_PORT -j ACCEPT
 
-    # Применяем NAT Loopback Fix (чтобы панель видела ноду по внешнему IP)
-    echo "[AUTO-FIX] Применение NAT Loopback Fix..."
-    iptables -t nat -A OUTPUT -d $EXT_IP -p tcp --dport $WINGS_PORT -j DNAT --to-destination 127.0.0.1:$WINGS_PORT
-    
-    # Сохраняем правила IPTABLES (простая попытка)
-    if [ -x "$(command -v netfilter-persistent)" ]; then
-        netfilter-persistent save
-    fi
-
-    # Правим config.yml если он есть (стандартный инсталлер может его не создать полностью)
-    if [ -f /etc/pterodactyl/config.yml ]; then
-        sed -i "s/port: 8080/port: $WINGS_PORT/g" /etc/pterodactyl/config.yml
-        sed -i "s/bind_port: 2022/bind_port: $SFTP_PORT/g" /etc/pterodactyl/config.yml
-        # Разрешаем все подключения к API (0.0.0.0)
-        sed -i "s/host: 127.0.0.1/host: 0.0.0.0/g" /etc/pterodactyl/config.yml
+    if [ -f "$CONFIG_FILE" ]; then
+        # 1. Меняем порты
+        sed -i "s/port: .*/port: $WINGS_PORT/g" "$CONFIG_FILE"
+        sed -i "s/bind_port: .*/bind_port: $SFTP_PORT/g" "$CONFIG_FILE"
+        
+        # 2. Разрешаем слушать всё
+        sed -i "s/host: 127.0.0.1/host: 0.0.0.0/g" "$CONFIG_FILE"
+        
+        # 3. КРИТИЧЕСКИЙ ФИКС: Локальное соединение с панелью
+        # Это решает проблему "Deadline Exceeded" лучше, чем iptables
+        echo "[AUTO-FIX] Переключение Remote на локальный адрес..."
+        sed -i "s|remote: .*|remote: http://127.0.0.1:$PANEL_PORT|g" "$CONFIG_FILE"
+        
+        # 4. КРИТИЧЕСКИЙ ФИКС: CORS (Разрешенные источники)
+        # Нужно, чтобы браузер мог общаться с нодой, даже если remote=127.0.0.1
+        echo "[AUTO-FIX] Добавление allowed_origins..."
+        # Удаляем старую строку если есть
+        grep -v "allowed_origins:" "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+        # Добавляем новую
+        echo "allowed_origins:" >> "$CONFIG_FILE"
+        echo "  - \"http://$EXT_IP:$PANEL_PORT\"" >> "$CONFIG_FILE"
+        
         systemctl restart wings
+    else
+        echo "[WARNING] Файл $CONFIG_FILE не найден! Сначала установите Wings."
     fi
   fi
 
@@ -122,6 +138,15 @@ execute() {
   echo -e "\n\n* pterodactyl-installer $(date) \n\n" >>$LOG_PATH
 
   [[ "$1" == *"canary"* ]] && export GITHUB_SOURCE="master" && export SCRIPT_RELEASE="canary"
+
+  # Если выбран режим ТОЛЬКО ФИКС (без установки)
+  if [[ "$1" == "fix_only" ]]; then
+      echo "Запуск режима исправления существующей установки..."
+      apply_custom_fixes "panel"
+      apply_custom_fixes "wings"
+      echo "Все исправления применены. Проверьте панель через минуту."
+      return
+  fi
 
   update_lib_source
 
@@ -157,10 +182,11 @@ while [ "$done" == false ]; do
   options=(
     "Install the panel"
     "Install Wings"
-    "Install both [0] and [1] on the same machine (wings script runs after panel)"
-    "Install panel with canary version of the script"
-    "Install Wings with canary version of the script"
+    "Install both [0] and [1] on the same machine"
+    "Install panel with canary version"
+    "Install Wings with canary version"
     "Install both [3] and [4] on the same machine"
+    "Repair/Update Ports (Apply fixes to EXISTING installation)"
   )
 
   actions=(
@@ -170,6 +196,7 @@ while [ "$done" == false ]; do
     "panel_canary"
     "wings_canary"
     "panel_canary;wings_canary"
+    "fix_only"
   )
 
   output "What would you like to do?"
@@ -191,5 +218,5 @@ while [ "$done" == false ]; do
 
 done
 
-# Remove lib.sh, so next time the script is run the, newest version is downloaded.
+# Remove lib.sh
 rm -rf /tmp/lib.sh
